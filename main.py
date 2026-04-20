@@ -1,398 +1,668 @@
-"""main.py
-Serveur FastAPI pour gérer les messages WhatsApp (Meta Cloud API)
-Fonctionnalités:
-- Vérification du webhook (GET /webhook)
-- Réception des messages (POST /webhook)
-- Envoi de textes et d'audios via l'API WhatsApp Cloud
-- Enregistrement des leads dans Google Sheets via gspread
+"""Serveur FastAPI pour l'agent WhatsApp Supmedical Academy.
 
-Toutes les sections sont commentées en français.
+Architecture:
+- matcher.py: normalisation + fuzzy matching (rapidfuzz)
+- whatsapp_service.py: envoi texte/audio/boutons + upload media
+- main.py: orchestration conversationnelle + webhook + lead capture
 """
 
-import os
+from __future__ import annotations
+
 import json
+import os
 import re
 import time
-from datetime import datetime
-from typing import Dict, Any
+from typing import Any, Dict, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
-import requests
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-import gspread
-from google.oauth2.service_account import Credentials
+from database import DEFAULT_GREETING, formations_db
+from google_sheets_service import save_lead as save_lead_to_sheet
+from matcher import (
+    format_formations_menu,
+    looks_like_menu_request,
+    match_formation,
+    normalize_text,
+    parse_menu_selection,
+)
+from session_store import (
+    cleanup_expired_sessions,
+    delete_session as delete_session_from_db,
+    init_session_store,
+    load_session as load_session_from_db,
+    save_session as save_session_to_db,
+)
+from whatsapp_service import (
+    send_whatsapp_audio,
+    send_whatsapp_buttons,
+    send_whatsapp_text,
+    upload_media_to_whatsapp,
+)
 
-# Import local database des formations
-from database import formations_db, DEFAULT_GREETING, _strip_accents
 
-try:
-    from rapidfuzz import fuzz, process
-    RAPIDFUZZ_AVAILABLE = True
-except Exception:
-    RAPIDFUZZ_AVAILABLE = False
-
-# Charger les variables d'environnement depuis .env
 load_dotenv()
 
-# Configuration (à définir dans .env)
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")  # ex: 1234567890
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # ID de la feuille Google
-TEST_MODE = os.getenv("TEST_MODE", "0").lower() in ("1", "true", "yes")
+
+YES_WORDS = {"oui", "ok", "okay", "daccord", "d accord", "yes", "ouais", "bien sur"}
+NO_WORDS = {"non", "no", "nop", "pas maintenant"}
 
 app = FastAPI(title="Supmedical WhatsApp Bot")
 
-# Session mémoire (en RAM) pour suivre l'état de la conversation par numéro
-# Structure: { phone_number: {"state": str, "formation": str, "ts": float} }
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+# Sessions légères en mémoire
+# Exemple: {"2127...": {"state": "awaiting_callback_details", "formation": "...", "ts": 12345.6}}
 sessions: Dict[str, Dict[str, Any]] = {}
+MEDIA_CACHE_PATH = os.getenv("WHATSAPP_MEDIA_CACHE_PATH", "media_cache.json")
+SESSION_TIMEOUT_SECONDS = _int_env("SESSION_TIMEOUT_SECONDS", 1800)
+SESSION_TIMEOUT_NOTICE = "⌛ Votre session a expiré. Je vous renvoie le menu pour reprendre."
+MAX_AUDIO_RECOVERY_RETRIES = 1
+AUDIO_RECOVERY_NOTICE = "🔁 L'audio a été rejeté par Meta. Je le renvoie en version compatible."
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+def log_event(level: str, phone: str | None, event: str, **fields: Any) -> None:
+    payload = {
+        "level": level.upper(),
+        "phone": phone,
+        "event": event,
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False))
 
-def is_greeting(text: str) -> bool:
-    """Détecte une salutation simple en français/anglais.
-    Utilisé pour renvoyer le message d'accueil professionnel.
-    """
-    if not text:
+
+def load_media_cache() -> Dict[str, str]:
+    if not os.path.exists(MEDIA_CACHE_PATH):
+        return {}
+    try:
+        with open(MEDIA_CACHE_PATH, "r", encoding="utf-8") as file_obj:
+            payload = json.load(file_obj)
+        if isinstance(payload, dict):
+            return {str(key): str(value) for key, value in payload.items() if value}
+    except Exception as exc:
+        log_event("error", None, "media_cache_load_failed", path=MEDIA_CACHE_PATH, error=str(exc))
+    return {}
+
+
+def save_media_cache(cache: Dict[str, str]) -> None:
+    try:
+        with open(MEDIA_CACHE_PATH, "w", encoding="utf-8") as file_obj:
+            json.dump(cache, file_obj, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log_event("error", None, "media_cache_save_failed", path=MEDIA_CACHE_PATH, error=str(exc))
+
+
+def _normalize_session(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload or {})
+    try:
+        ts = float(data.get("ts") or 0)
+    except Exception:
+        ts = 0.0
+    if ts <= 0:
+        data["ts"] = time.time()
+    return data
+
+
+def set_session(phone: str, payload: Dict[str, Any]) -> None:
+    data = _normalize_session(payload)
+    sessions[phone] = data
+    try:
+        save_session_to_db(phone, data)
+    except Exception as exc:
+        log_event("error", phone, "session_persist_failed", error=str(exc))
+
+
+def clear_session(phone: str) -> None:
+    sessions.pop(phone, None)
+    try:
+        delete_session_from_db(phone)
+    except Exception as exc:
+        log_event("error", phone, "session_delete_failed", error=str(exc))
+
+
+def _is_session_expired(payload: Dict[str, Any]) -> bool:
+    try:
+        ts = float(payload.get("ts") or 0)
+    except Exception:
         return False
-    text_lower = text.lower()
-    greetings = ["bonjour", "bonsoir", "salut", "coucou", "hello", "hi", "bjr"]
-    for g in greetings:
-        if re.search(r"\b" + re.escape(g) + r"\b", text_lower):
+    if ts <= 0:
+        return False
+    if SESSION_TIMEOUT_SECONDS <= 0:
+        return False
+    return (time.time() - ts) > SESSION_TIMEOUT_SECONDS
+
+
+def get_active_session(phone: str) -> tuple[Optional[Dict[str, Any]], bool]:
+    session = sessions.get(phone)
+
+    if not session:
+        try:
+            session = load_session_from_db(phone, SESSION_TIMEOUT_SECONDS)
+        except Exception as exc:
+            log_event("error", phone, "session_load_failed", error=str(exc))
+            session = None
+        if session:
+            sessions[phone] = session
+
+    if session and _is_session_expired(session):
+        clear_session(phone)
+        return None, True
+
+    return session, False
+
+
+def touch_session(phone: str, session: Optional[Dict[str, Any]]) -> None:
+    if not session:
+        return
+    refreshed = dict(session)
+    refreshed["ts"] = time.time()
+    set_session(phone, refreshed)
+
+
+MEDIA_ID_CACHE = load_media_cache()
+AUDIO_MESSAGE_CONTEXT: Dict[str, Dict[str, Any]] = {}
+AUDIO_RECOVERY_ATTEMPTS: Dict[str, int] = {}
+
+try:
+    init_session_store()
+    cleanup_expired_sessions(SESSION_TIMEOUT_SECONDS)
+except Exception as exc:
+    log_event("error", None, "session_store_init_failed", error=str(exc))
+
+
+@app.get("/")
+async def root() -> JSONResponse:
+    return JSONResponse(
+        {
+            "service": "Supmedical WhatsApp Bot",
+            "status": "ok",
+            "webhook": "/webhook",
+            "port": 8002,
+        }
+    )
+
+
+@app.get("/health")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "supmedical-whatsapp-bot"})
+
+
+def is_greeting(message: str) -> bool:
+    text = normalize_text(message)
+    greetings = {"bonjour", "bonsoir", "salut", "coucou", "hello", "hi", "bjr"}
+    return any(word in text.split() for word in greetings)
+
+
+def is_menu_reset_command(message: str) -> bool:
+    normalized = normalize_text(message)
+    tokens = normalized.split()
+    if normalized == "0":
+        return True
+    if "0" in tokens:
+        return True
+    if "menu" in tokens:
+        return True
+    return False
+
+
+def parse_name_and_callback(raw_text: str) -> Tuple[str, str]:
+    text = (raw_text or "").strip()
+    if not text:
+        return "Prospect WhatsApp", "Non précisé"
+
+    # Format attendu: "Nom - Date/Créneau"
+    parts = re.split(r"\s*[-,;|]\s*", text, maxsplit=1)
+    if len(parts) == 2:
+        name = parts[0].strip() or "Prospect WhatsApp"
+        callback = parts[1].strip() or "Non précisé"
+        return name, callback
+
+    return "Prospect WhatsApp", text
+
+
+def send_formations_menu(phone: str) -> None:
+    intro = "🧭 D'accord, je vous guide."
+    send_whatsapp_text(phone, f"{intro}\n\n{format_formations_menu(formations_db)}")
+
+
+def _extract_message_id(response: Any) -> Optional[str]:
+    try:
+        payload = response.json()
+        messages = payload.get("messages") or []
+        if messages and isinstance(messages[0], dict):
+            msg_id = messages[0].get("id")
+            if msg_id:
+                return str(msg_id)
+    except Exception:
+        return None
+    return None
+
+
+def _track_audio_message(phone: str, formation_name: str, media_id: str, response: Any) -> None:
+    message_id = _extract_message_id(response)
+    if not message_id:
+        return
+
+    AUDIO_MESSAGE_CONTEXT[message_id] = {
+        "phone": phone,
+        "formation": formation_name,
+        "media_id": media_id,
+        "ts": time.time(),
+    }
+
+    # Evite une croissance infinie en mémoire.
+    if len(AUDIO_MESSAGE_CONTEXT) > 200:
+        oldest = sorted(AUDIO_MESSAGE_CONTEXT.items(), key=lambda item: item[1].get("ts", 0))[:50]
+        for msg_id, _ in oldest:
+            AUDIO_MESSAGE_CONTEXT.pop(msg_id, None)
+
+
+def _session_formation(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return None
+    session, _ = get_active_session(phone)
+    return (session or {}).get("formation")
+
+
+def _is_media_processing_failure(errors: list[dict]) -> bool:
+    for error in errors:
+        code = error.get("code")
+        if code == 131053:
+            return True
+        details = ((error.get("error_data") or {}).get("details") or "").lower()
+        if "media upload error" in details:
             return True
     return False
 
 
-def send_whatsapp_text(to_number: str, message: str) -> requests.Response:
-    """Envoie un message texte via l'API WhatsApp Cloud.
+def _recover_failed_audio_status(recipient_id: Optional[str], status: Dict[str, Any]) -> None:
+    errors = status.get("errors") or []
+    if not _is_media_processing_failure(errors):
+        return
 
-    Remarque: `WHATSAPP_TOKEN` et `WHATSAPP_PHONE_NUMBER_ID` doivent être définis.
-    """
-    if TEST_MODE:
-        print(f"[TEST_MODE] send_whatsapp_text -> to={to_number} message={message}")
-        class _Mock:
-            ok = True
-            status_code = 200
-            def json(self):
-                return {"mock": True, "body": message}
-        return _Mock()
+    failed_message_id = str(status.get("id") or "")
+    context = AUDIO_MESSAGE_CONTEXT.pop(failed_message_id, None) if failed_message_id else None
 
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise RuntimeError("WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID not configured in .env")
+    phone = (context or {}).get("phone") or recipient_id
+    formation_name = (context or {}).get("formation") or _session_formation(phone)
 
-    url = f"https://graph.facebook.com/v16.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "text",
-        "text": {"preview_url": False, "body": message},
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=15)
-    return resp
+    if not phone or not formation_name:
+        log_event(
+            "error",
+            recipient_id,
+            "audio_recovery_skipped",
+            reason="missing_context",
+            failed_message_id=failed_message_id,
+        )
+        return
 
+    retry_key = f"{phone}:{formation_name}"
+    current_attempts = AUDIO_RECOVERY_ATTEMPTS.get(retry_key, 0)
+    if current_attempts >= MAX_AUDIO_RECOVERY_RETRIES:
+        log_event(
+            "error",
+            phone,
+            "audio_recovery_skipped",
+            reason="retry_limit_reached",
+            formation=formation_name,
+            failed_message_id=failed_message_id,
+            attempts=current_attempts,
+        )
+        return
 
-def send_whatsapp_audio(to_number: str, media_id: str) -> requests.Response:
-    """Envoie un message audio (référence à un media ID déjà uploadé sur WhatsApp).
+    AUDIO_RECOVERY_ATTEMPTS[retry_key] = current_attempts + 1
+    log_event(
+        "info",
+        phone,
+        "audio_recovery_started",
+        formation=formation_name,
+        failed_message_id=failed_message_id,
+        retry=AUDIO_RECOVERY_ATTEMPTS[retry_key],
+    )
 
-    ATTENTION: le `media_id` attendu par l'API WhatsApp est l'ID Meta/WhatsApp (pas l'ID WordPress).
-    Si vos fichiers audio sont stockés ailleurs, il faut d'abord les uploader via l'endpoint /media
-    pour obtenir un `media_id` utilisable.
-    """
-    if TEST_MODE:
-        print(f"[TEST_MODE] send_whatsapp_audio -> to={to_number} media_id={media_id}")
-        class _Mock:
-            ok = True
-            status_code = 200
-            def json(self):
-                return {"mock": True, "media_id": media_id}
-        return _Mock()
-
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise RuntimeError("WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID not configured in .env")
-
-    url = f"https://graph.facebook.com/v16.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to_number,
-        "type": "audio",
-        "audio": {"id": str(media_id)},
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    return resp
-
-
-def upload_media_to_whatsapp(local_path: str, mime_type: str = "audio/ogg") -> str | None:
-    """Upload a local file to WhatsApp Cloud and return the returned media ID.
-
-    Requires `WHATSAPP_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` set in env.
-    """
-    if TEST_MODE:
-        print(f"[TEST_MODE] upload_media_to_whatsapp -> local_path={local_path}")
-        return f"mock-{os.path.basename(local_path)}"
-
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
-        raise RuntimeError("WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID not configured in .env")
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(local_path)
-
-    url = f"https://graph.facebook.com/v16.0/{WHATSAPP_PHONE_NUMBER_ID}/media"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    with open(local_path, "rb") as f:
-        files = {"file": (os.path.basename(local_path), f, mime_type)}
-        resp = requests.post(url, headers=headers, files=files, timeout=60)
     try:
-        data = resp.json()
-    except Exception:
-        print("Upload response not JSON:", resp.status_code, resp.text)
-        return None
-    if resp.ok:
-        return data.get("id")
-    print("Upload failed:", data)
-    return None
-
-
-def get_gspread_client() -> gspread.Client:
-    """Initialise et retourne un client gspread à partir d'un JSON de service account.
-
-    Attent: la variable `GOOGLE_SERVICE_ACCOUNT_JSON` peut être soit un chemin vers
-    un fichier JSON, soit le contenu JSON lui-même (encodé en string) — pratique pour
-    stocker dans des CI/CD ou un secret manager.
-    """
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set in .env")
-
-    # charger la JSON soit depuis la string soit depuis un fichier
-    try:
-        if GOOGLE_SERVICE_ACCOUNT_JSON.strip().startswith("{"):
-            sa_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        else:
-            with open(GOOGLE_SERVICE_ACCOUNT_JSON, "r", encoding="utf-8") as f:
-                sa_info = json.load(f)
+        send_whatsapp_text(phone, AUDIO_RECOVERY_NOTICE)
     except Exception as exc:
-        raise RuntimeError(f"Service account JSON invalide: {exc}")
+        log_event("error", phone, "audio_recovery_notice_failed", error=str(exc))
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-    client = gspread.authorize(creds)
-    return client
-
-
-def save_lead(phone: str, formation: str, availability: str) -> bool:
-    """Enregistre un prospect dans la Google Sheet (ID: GOOGLE_SHEET_ID).
-
-    Colonne enregistrée: Timestamp UTC, Numéro, Formation, Disponibilités (texte libre)
-    """
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("GOOGLE_SHEET_ID not configured in .env")
     try:
-        client = get_gspread_client()
-        sh = client.open_by_key(GOOGLE_SHEET_ID)
-        worksheet = sh.sheet1
-        ts = datetime.utcnow().isoformat()
-        row = [ts, phone, formation, availability]
-        worksheet.append_row(row)
-        return True
+        send_formation_multimodal(
+            phone,
+            formation_name,
+            send_intro_text=False,
+            force_audio_refresh=True,
+        )
     except Exception as exc:
-        print("Erreur lors de l'enregistrement du lead:", exc)
+        log_event("error", phone, "audio_recovery_failed", formation=formation_name, error=str(exc))
+
+
+def send_formation_multimodal(
+    phone: str,
+    formation_name: str,
+    send_intro_text: bool = True,
+    force_audio_refresh: bool = False,
+) -> None:
+    """Envoi texte puis audio (media_id prioritaire, sinon local_media)."""
+    info = formations_db.get(formation_name, {})
+    link = info.get("registration_link", "")
+
+    if send_intro_text:
+        text_msg = (
+            f"🎓 *{formation_name}*\n"
+            f"🔗 Programme et inscription : {link}\n"
+            "🎧 Je vous envoie l'audio explicatif juste après."
+        )
+        send_whatsapp_text(phone, text_msg)
+        time.sleep(1)
+
+    media_id = None if force_audio_refresh else (MEDIA_ID_CACHE.get(formation_name) or info.get("media_id"))
+    local_media = info.get("local_media")
+
+    if force_audio_refresh:
+        log_event("info", phone, "audio_refresh_forced", formation=formation_name)
+
+    def _resp_error_details(resp: Any) -> str:
+        try:
+            return json.dumps(resp.json(), ensure_ascii=False)
+        except Exception:
+            return getattr(resp, "text", "unknown error")
+
+    def _try_send_audio(mid: Any) -> bool:
+        if not mid:
+            return False
+        response = send_whatsapp_audio(phone, str(mid))
+        if getattr(response, "ok", False):
+            log_event("info", phone, "audio_send_ok", formation=formation_name, media_id=str(mid))
+            _track_audio_message(phone, formation_name, str(mid), response)
+            return True
+        log_event(
+            "error",
+            phone,
+            "audio_send_failed",
+            formation=formation_name,
+            media_id=str(mid),
+            response=_resp_error_details(response),
+        )
         return False
+
+    audio_sent = False
+
+    # Priorité au media_id (plus rapide).
+    if media_id:
+        try:
+            audio_sent = _try_send_audio(media_id)
+        except Exception as exc:
+            print("[media] send audio raised error:", exc)
+
+    # Si media_id absent OU invalide, fallback upload local + resend.
+    if (not audio_sent) and local_media:
+        try:
+            uploaded_id = upload_media_to_whatsapp(local_media)
+            if uploaded_id:
+                MEDIA_ID_CACHE[formation_name] = uploaded_id
+                save_media_cache(MEDIA_ID_CACHE)
+                info["media_id"] = uploaded_id
+                audio_sent = _try_send_audio(uploaded_id)
+                if audio_sent:
+                    log_event(
+                        "info",
+                        phone,
+                        "audio_uploaded_and_cached",
+                        formation=formation_name,
+                        media_id=uploaded_id,
+                        cache_path=MEDIA_CACHE_PATH,
+                    )
+        except Exception as exc:
+            log_event("error", phone, "audio_local_upload_failed", formation=formation_name, error=str(exc))
+
+    if not audio_sent:
+        send_whatsapp_text(
+            phone,
+            "ℹ️ L'audio n'est pas encore disponible sur Meta. Un conseiller peut vous l'envoyer rapidement.",
+        )
+        log_event("error", phone, "audio_not_sent", formation=formation_name)
+
+
+def ask_callback_preference(phone: str, formation_name: str) -> None:
+    prompt = (
+        f"📞 Souhaitez-vous être rappelé au sujet de *{formation_name}* ?\n"
+        "Répondez Oui ou Non."
+    )
+    try:
+        send_whatsapp_buttons(phone, prompt, ["Oui", "Non", "Formations"])
+    except Exception:
+        send_whatsapp_text(phone, prompt)
+
+
+def handle_message(phone: str, text: str) -> None:
+    message = (text or "").strip()
+    normalized = normalize_text(message)
+    session, session_expired = get_active_session(phone)
+    log_event("info", phone, "incoming_message", message=message, normalized=normalized, session_state=session.get("state") if session else None)
+
+    if session_expired:
+        send_whatsapp_text(phone, SESSION_TIMEOUT_NOTICE)
+        send_formations_menu(phone)
+        session = None
+
+    # Raccourci global: retour menu à tout moment via "0" ou "menu".
+    if is_menu_reset_command(message):
+        clear_session(phone)
+        send_formations_menu(phone)
+        return
+
+    touch_session(phone, session)
+
+    # 1) Etat: confirmation d'une suggestion fuzzy
+    if session and session.get("state") == "awaiting_suggestion_confirmation":
+        suggested_formation = session.get("formation")
+        if normalized in YES_WORDS and suggested_formation:
+            send_formation_multimodal(phone, suggested_formation)
+            set_session(phone, {
+                "state": "awaiting_callback_consent",
+                "formation": suggested_formation,
+                "ts": time.time(),
+            })
+            ask_callback_preference(phone, suggested_formation)
+            return
+
+        if normalized in NO_WORDS:
+            clear_session(phone)
+            send_formations_menu(phone)
+            return
+        # Sinon, on continue le flux normal avec le texte libre.
+
+    # 2) Etat: attente du choix oui/non pour rappel
+    if session and session.get("state") == "awaiting_callback_consent":
+        if normalized in YES_WORDS:
+            set_session(phone, {
+                "state": "awaiting_callback_details",
+                "formation": session.get("formation"),
+                "ts": time.time(),
+            })
+            send_whatsapp_text(
+                phone,
+                "📝 Parfait. Envoyez votre *nom* et votre *créneau de rappel* (ex: `Salim - demain 15h`).",
+            )
+            return
+
+        if normalized in NO_WORDS:
+            clear_session(phone)
+            send_whatsapp_text(phone, "👌 Très bien. Tapez *formations* si vous voulez voir toutes les options.")
+            return
+
+        if looks_like_menu_request(message):
+            clear_session(phone)
+            send_formations_menu(phone)
+            return
+
+        send_whatsapp_text(phone, "Je n'ai pas compris 🤔. Répondez *Oui* ou *Non*.")
+        return
+
+    # 3) Etat: attente détail lead
+    # - awaiting_callback_details: l'utilisateur envoie "Nom - créneau"
+    # - awaiting_time: mode compatibilité, nom déjà connu en session
+    if session and session.get("state") in {"awaiting_callback_details", "awaiting_time"}:
+        if session.get("state") == "awaiting_time":
+            lead_name = (session.get("lead_name") or "Prospect WhatsApp").strip()
+            callback_date = message or "Non précisé"
+        else:
+            lead_name, callback_date = parse_name_and_callback(message)
+        lead_formation = session.get("formation", "Non précisé")
+
+        saved = save_lead_to_sheet(lead_name, phone, callback_date, lead_formation)
+        if saved:
+            send_whatsapp_text(phone, "✅ C'est noté, un conseiller reviendra vers vous.")
+        else:
+            send_whatsapp_text(phone, "⚠️ Je n'ai pas pu enregistrer votre demande pour le moment. Un conseiller prendra le relais.")
+            log_event(
+                "error",
+                phone,
+                "lead_save_failed",
+                formation=lead_formation,
+                callback_date=callback_date,
+            )
+        clear_session(phone)
+        return
+
+    # 4) Intentions globales: salutations + menu
+    if is_greeting(message):
+        send_whatsapp_text(
+            phone,
+            (
+                f"👋 {DEFAULT_GREETING}\n\n"
+                "Tapez *formations* pour afficher le menu, "
+                "ou envoyez directement un mot-clé (ex: *nutrition*)."
+            ),
+        )
+        return
+
+    if looks_like_menu_request(message):
+        send_formations_menu(phone)
+        return
+
+    # Choix guide via numero/emoji du menu (ex: "2" ou "2️⃣" ou "je choisis 2")
+    selected_from_menu = parse_menu_selection(message, formations_db)
+    if selected_from_menu:
+        send_formation_multimodal(phone, selected_from_menu)
+        set_session(phone, {
+            "state": "awaiting_callback_consent",
+            "formation": selected_from_menu,
+            "ts": time.time(),
+        })
+        ask_callback_preference(phone, selected_from_menu)
+        return
+
+    # 5) Matching intelligent selon les seuils demandés
+    mode, formation_name, score = match_formation(message, formations_db)
+
+    if mode == "direct" and formation_name:
+        send_formation_multimodal(phone, formation_name)
+        set_session(phone, {
+            "state": "awaiting_callback_consent",
+            "formation": formation_name,
+            "ts": time.time(),
+        })
+        ask_callback_preference(phone, formation_name)
+        return
+
+    if mode == "suggestion" and formation_name:
+        suggestion_msg = (
+            f"🤔 Vouliez-vous dire *{formation_name}* ?\n"
+            "Tapotez *Oui* ou tapez le nom correctement."
+        )
+        send_whatsapp_text(phone, suggestion_msg)
+        set_session(phone, {
+            "state": "awaiting_suggestion_confirmation",
+            "formation": formation_name,
+            "score": score,
+            "ts": time.time(),
+        })
+        return
+
+    # mode menu (<55)
+    fallback = "Désolé, je n'ai pas bien saisi."
+    send_whatsapp_text(
+        phone,
+        f"{fallback}\n\n{format_formations_menu(formations_db)}",
+    )
 
 
 def handle_incoming_message(from_number: str, text: str) -> None:
-    """Logique principale de conversation en français.
+    """Compatibilité avec l'ancien nom de fonction."""
+    handle_message(from_number, text)
 
-    - Accueil si salutation
-    - Filtrage par mots-clés de `formations_db`
-    - Envoi audio (media_id) puis texte avec le lien d'inscription
-    - Après envoi audio, on attend la réponse de l'utilisateur puis demande de
-      disponibilité pour rappel et on enregistre le lead via `save_lead`.
-    """
-    text = (text or "").strip()
-    print(f"Incoming from {from_number}: {text}")
-
-    # 1) Accueil si salutation
-    if is_greeting(text):
-        greeting = (
-            "Bonjour/Bonsoir, l’équipe Supmedical Academy est ravie de vous accueillir. "
-            "Comment puis-je vous aider ? Souhaitez-vous des informations sur une formation spécifique ?"
-        )
-        send_whatsapp_text(from_number, greeting)
-        return
-
-    # 2) Si l'utilisateur vient de recevoir l'audio précédemment
-    session = sessions.get(from_number)
-    if session and session.get("state") == "awaiting_followup":
-        # l'utilisateur répond après l'audio => demander disponibilité
-        question = (
-            "Souhaitez-vous qu'un conseiller vous rappelle ? Si oui, merci de nous indiquer vos jours et heures de disponibilité."
-        )
-        send_whatsapp_text(from_number, question)
-        sessions[from_number]["state"] = "awaiting_availability"
-        return
-
-    # 3) Si l'utilisateur nous donne ses disponibilités (etat précédent)
-    if session and session.get("state") == "awaiting_availability":
-        formation = session.get("formation", "")
-        availability_text = text
-        saved = save_lead(from_number, formation, availability_text)
-        if saved:
-            send_whatsapp_text(from_number, "Merci — vos disponibilités ont été enregistrées. Un conseiller vous contactera prochainement.")
-        else:
-            send_whatsapp_text(from_number, "Désolé, une erreur est survenue lors de l'enregistrement. Nous allons réessayer de notre côté.")
-        # terminer la session
-        sessions.pop(from_number, None)
-        return
-
-    # 4) Filtrage par mots-clés (database.py) with fuzzy fallback
-    def find_best_formation(query: str, threshold: int = 75):
-        q_raw = (query or "").strip()
-        q_lower = q_raw.lower()
-        q_norm = _strip_accents(q_lower)
-
-        # exact substring (fast)
-        for formation_name, info in formations_db.items():
-            for kw in info.get("keywords", []):
-                if kw and (kw in q_lower or kw in q_norm):
-                    return formation_name, 100
-
-        # fuzzy match using RapidFuzz if available
-        if not RAPIDFUZZ_AVAILABLE:
-            return None, 0
-
-        choices = []
-        kw_to_formation = {}
-        for formation_name, info in formations_db.items():
-            for kw in info.get("keywords", []):
-                if not kw:
-                    continue
-                k = kw
-                choices.append(k)
-                kw_to_formation[k] = formation_name
-
-        if not choices:
-            return None, 0
-
-        # use token_set_ratio for robustness
-        match = process.extractOne(q_norm, choices, scorer=fuzz.token_set_ratio)
-        if match:
-            best_kw, score, _ = match
-            formation = kw_to_formation.get(best_kw)
-            if score >= threshold:
-                return formation, int(score)
-        return None, 0
-
-    formation_name, score = find_best_formation(text, threshold=70)
-    if formation_name:
-        info = formations_db.get(formation_name, {})
-        media_id = info.get("media_id")
-        # if no media_id but local_media exists, try uploading
-        if not media_id and info.get("local_media"):
-            try:
-                local_path = info.get("local_media")
-                if os.path.exists(local_path):
-                    uploaded_id = upload_media_to_whatsapp(local_path)
-                    if uploaded_id:
-                        info["media_id"] = uploaded_id
-                        media_id = uploaded_id
-            except Exception as exc:
-                print("Upload media error:", exc)
-
-        try:
-            if media_id:
-                send_whatsapp_audio(from_number, media_id)
-        except Exception as exc:
-            print("Erreur en envoyant l'audio:", exc)
-
-        # Envoyer texte avec lien d'inscription
-        link = info.get("registration_link", "")
-        msg = f"Voici les détails en audio. Vous pouvez aussi consulter le programme et vous inscrire ici : {link}"
-        send_whatsapp_text(from_number, msg)
-
-        # Marquer la session en attente de réponse utilisateur
-        sessions[from_number] = {"state": "awaiting_followup", "formation": formation_name, "ts": time.time()}
-        return
-
-    # 5) Réponse par défaut si aucun mot-clé trouvé
-    fallback = (
-        "Je n'ai pas trouvé de formation correspondant à votre demande. "
-        "Souhaitez-vous consulter la liste des formations disponibles ?"
-    )
-    send_whatsapp_text(from_number, fallback)
-
-
-# ------------------------------------------------------------------
-# Endpoints Webhook
-# ------------------------------------------------------------------
 
 @app.get("/webhook")
 async def webhook_verify(request: Request):
-    """Vérification du webhook (procédure demandée par Meta lors de l'enregistrement).
-
-    Meta envoie: hub.mode, hub.challenge, hub.verify_token
-    """
     params = request.query_params
     mode = params.get("hub.mode")
     challenge = params.get("hub.challenge")
-    token = params.get("hub.verify_token")
+    verify_token = params.get("hub.verify_token")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        # Retourner le challenge en clair
+    if mode == "subscribe" and verify_token == VERIFY_TOKEN:
         return PlainTextResponse(challenge)
     raise HTTPException(status_code=403, detail="Verification token mismatch")
 
 
 @app.post("/webhook")
 async def webhook_receive(request: Request):
-    """Point d'entrée pour les notifications WhatsApp envoyées par Meta.
-
-    Le payload contient généralement: entry -> changes -> value -> messages
-    Nous extrayons le numéro (wa_id) et le texte, puis appelons handle_incoming_message.
-    """
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # parcourir les entrées (robuste face aux variantes du payload)
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
             messages = value.get("messages") or []
             contacts = value.get("contacts") or []
+            statuses = value.get("statuses") or []
+
+            for status in statuses:
+                status_value = status.get("status")
+                recipient_id = status.get("recipient_id")
+                errors = status.get("errors") or []
+                if status_value == "failed":
+                    log_event(
+                        "error",
+                        recipient_id,
+                        "whatsapp_delivery_failed",
+                        message_id=status.get("id"),
+                        errors=errors,
+                        raw_status=status,
+                    )
+                    _recover_failed_audio_status(recipient_id, status)
+                else:
+                    log_event(
+                        "info",
+                        recipient_id,
+                        "whatsapp_delivery_status",
+                        status=status_value,
+                        message_id=status.get("id"),
+                    )
 
             for msg in messages:
-                # numéro WhatsApp
                 wa_id = None
                 if contacts and isinstance(contacts, list):
                     wa_id = contacts[0].get("wa_id")
-                # fallback
                 if not wa_id:
                     wa_id = msg.get("from")
-
                 if not wa_id:
                     continue
 
-                # extraire le texte si disponible
                 text_body = ""
-                if msg.get("type") == "text":
+                msg_type = msg.get("type")
+                if msg_type == "text":
                     text_body = msg.get("text", {}).get("body", "")
-                elif msg.get("type") == "interactive":
+                elif msg_type == "interactive":
                     interactive = msg.get("interactive", {})
                     if "button_reply" in interactive:
                         text_body = interactive["button_reply"].get("title", "")
@@ -401,17 +671,15 @@ async def webhook_receive(request: Request):
                 else:
                     text_body = msg.get("text", {}).get("body", "")
 
-                # traiter le message (fonction sync: ne bloque pas beaucoup)
                 try:
-                    handle_incoming_message(wa_id, text_body)
+                    handle_message(wa_id, text_body)
                 except Exception as exc:
-                    print("Erreur traitement message:", exc)
+                    print("[webhook] message handling error:", exc)
 
     return JSONResponse({"status": "received"})
 
 
 if __name__ == "__main__":
-    # Pour le développement local: uvicorn main:app --reload
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

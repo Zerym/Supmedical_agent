@@ -43,25 +43,25 @@ def _expand_keyword_variants(kw: str):
 formations_db = {
     "Gestionnaire Parapharmacie & Dermo-Conseiller": {
         "keywords": ["parapharmacie", "dermo", "gestionnaire parapharmacie", "dermo-conseiller", "dermo-cosmétologie", "dermo-cosmetologie", "produits cosmétiques", "produits cosmetiques", "produits cosmétique", "produits cosmetique", "conseil cosmétique", "conseil cosmetique"],
-        "media_id": "945147088408452",
+        "media_id": "2226826701459022",
         "local_media": "media/parapharmacie.ogg",
         "registration_link": "https://supmedical.ma/formations/formation-gestionnaire-parapharmacie-et-dermo-conseiller-e-en-produits-cosmetiques/",
     },
     "Vente & Conseil Dispositifs Médicaux": {
         "keywords": ["dispositifs", "dispositif", "medical", "medicaux", "dispositifs médicaux", "dispositifs medicaux", "produits médicaux", "produits medicaux", "vente", "conseil", "réglementation dispositifs médicaux", "reglementation dispositifs medicaux"],
-        "media_id": "1404170128180926",
+        "media_id": "1375111737985705",
         "local_media": "media/dispositifs_medicaux.ogg",
         "registration_link": "https://supmedical.ma/formations/formation-parapharamcie-en-vente-et-conseil-des-dispositifs-medicaux-produits-medicaux/",
     },
     "Conseiller en Nutrition & Bien-être": {
         "keywords": ["nutrition", "bienetre", "bien-être", "bien-etre", "conseil nutritionnel", "compléments alimentaires", "complements alimentaires", "compléments alimentaire", "complements alimentaire", "bilan nutritionnel", "diététique", "dietetique"],
-        "media_id": "942622131910856",
+        "media_id": "2041327436729284",
         "local_media": "media/nutrition.ogg",
         "registration_link": "https://supmedical.ma/formations/conseiller-en-nutrition-bien-etre/",
     },
     "Vente & Conseil Compléments Alimentaires": {
         "keywords": ["complement", "complements", "complément", "compléments", "compléments alimentaires", "complements alimentaires", "compléments alimentaire", "complements alimentaire", "vente compléments", "vente complements", "vente complément", "vente complement", "conseil compléments", "conseil complements", "conseil complément", "conseil complement", "réglementation compléments", "reglementation complements", "réglementation complément", "reglementation complement", "étiquetage", "etiquetage"],
-        "media_id": "1616983709510954",
+        "media_id": "821254160531588",
         "local_media": "media/complements_alimentaires.ogg",
         "registration_link": "https://supmedical.ma/formations/formation-vente-et-conseil-des-complements-alimentaires/",
     },
