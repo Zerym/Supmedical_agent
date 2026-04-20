@@ -1,4 +1,4 @@
-"""End-to-end local test script for Supmedical WhatsApp Bot.
+r"""End-to-end local test script for Supmedical WhatsApp Bot.
 
 Run after starting the server with TEST_MODE=1 and VERIFY_TOKEN=TEST_VERIFY:
 
@@ -58,6 +58,7 @@ def run_all():
     samples = [
         "Bonjour",
         "nutrition",
+        "nuti diete",  # suggestion attendue
         "compléments alimentaires",
         "complements alimentairess",  # typo/plural
         "dispositifs médicaux",
