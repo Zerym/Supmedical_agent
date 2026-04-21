@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 import sqlite3
@@ -18,8 +19,17 @@ def _connect(db_path: Optional[str] = None) -> sqlite3.Connection:
     return conn
 
 
+@contextmanager
+def _db_connection(db_path: Optional[str] = None):
+    conn = _connect(db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def init_session_store(db_path: Optional[str] = None) -> None:
-    with _connect(db_path) as conn:
+    with _db_connection(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
@@ -35,7 +45,7 @@ def init_session_store(db_path: Optional[str] = None) -> None:
 def save_session(phone: str, payload: Dict[str, Any], db_path: Optional[str] = None) -> None:
     now = time.time()
     raw_payload = json.dumps(payload, ensure_ascii=False)
-    with _connect(db_path) as conn:
+    with _db_connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO sessions(phone, payload, updated_at)
@@ -49,7 +59,7 @@ def save_session(phone: str, payload: Dict[str, Any], db_path: Optional[str] = N
 
 
 def load_session(phone: str, ttl_seconds: int, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    with _connect(db_path) as conn:
+    with _db_connection(db_path) as conn:
         row = conn.execute(
             "SELECT payload, updated_at FROM sessions WHERE phone = ?",
             (phone,),
@@ -83,7 +93,7 @@ def load_session(phone: str, ttl_seconds: int, db_path: Optional[str] = None) ->
 
 
 def delete_session(phone: str, db_path: Optional[str] = None) -> None:
-    with _connect(db_path) as conn:
+    with _db_connection(db_path) as conn:
         conn.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
         conn.commit()
 
@@ -93,7 +103,7 @@ def cleanup_expired_sessions(ttl_seconds: int, db_path: Optional[str] = None) ->
         return 0
 
     cutoff = time.time() - ttl_seconds
-    with _connect(db_path) as conn:
+    with _db_connection(db_path) as conn:
         cursor = conn.execute("DELETE FROM sessions WHERE updated_at < ?", (cutoff,))
         conn.commit()
         return cursor.rowcount or 0
