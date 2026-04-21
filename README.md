@@ -34,6 +34,16 @@ GOOGLE_CREDS_FILE=C:/Users/you/Documents/Supmedical_Agent/credentials.json
 # Session timeout (30 min)
 SESSION_TIMEOUT_SECONDS=1800
 
+# Coexistence bot + humain
+WHATSAPP_COEXISTENCE_ENABLED=1
+WHATSAPP_COEXISTENCE_AUTO_DETECT=1
+HUMAN_OVERRIDE_TIMEOUT_SECONDS=1800
+BOT_OUTBOUND_MESSAGE_TTL_SECONDS=7200
+
+# Optionnel: protege les endpoints /handoff/*
+HANDOFF_API_TOKEN=change_me
+HANDOFF_ALLOWED_SOURCES=203.0.113.10,198.51.100.0/24
+
 # Google Sheets retry policy (1 retry => 2 tentatives)
 GOOGLE_SHEETS_RETRIES=1
 GOOGLE_SHEETS_RETRY_DELAY_SECONDS=1.0
@@ -42,6 +52,8 @@ GOOGLE_SHEETS_RETRY_DELAY_SECONDS=1.0
 Important:
 - `GOOGLE_CREDS_FILE` doit pointer vers un vrai `credentials.json`.
 - `TEST_MODE` doit etre vide (ou `0`) pour les vrais uploads Meta.
+- `HANDOFF_API_TOKEN` doit etre long et aleatoire en production.
+- `HANDOFF_ALLOWED_SOURCES` doit contenir uniquement les IP/CIDR de vos outils (CRM, reverse proxy, bastion). Si vide, aucune restriction IP n'est appliquee.
 
 ## 4) Webhook Meta: etapes obligatoires
 
@@ -150,5 +162,44 @@ Dans un autre terminal:
 
 ```powershell
 .\.venv\Scripts\python.exe tests\interactive_client.py --server http://127.0.0.1:8002
+```
+
+Tests coexistence (bot/humain):
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_coexistence -v
+```
+
+## 10) Coexistence bot + humain (WhatsApp Business App + Cloud API)
+
+Le bot supporte maintenant un mode `human_active` persiste en `session_store.db`.
+
+Comportement:
+- Si une conversation est en `human_active`, le bot reste silencieux pour eviter les conflits.
+- Si aucun signe d'activite humaine n'est detecte pendant `HUMAN_OVERRIDE_TIMEOUT_SECONDS`, le bot repasse en `bot_mode`.
+- Si l'utilisateur ecrit un message de type "conseiller", "agent" ou "humain", le bot bascule la conversation en mode humain.
+- Si l'utilisateur envoie "bot" / "resume bot", le bot reprend la main.
+
+Auto-detection coexistence:
+- Les webhooks `statuses` avec `status=sent` non reconnus comme messages bot sont interpretes comme activite humaine (coexistence active).
+
+Endpoints manuels (CRM / shared inbox):
+
+1. Activer mode humain
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8002/handoff/takeover" `
+	-Headers @{"x-handoff-token"="change_me"} `
+	-ContentType "application/json" `
+	-Body '{"phone":"21260000001","reason":"hubspot_takeover","actor":"support_agent","notify_user":true}'
+```
+
+2. Rendre la main au bot
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8002/handoff/release" `
+	-Headers @{"x-handoff-token"="change_me"} `
+	-ContentType "application/json" `
+	-Body '{"phone":"21260000001","reason":"ticket_closed","actor":"support_agent","reset_conversation":true,"notify_user":false}'
 ```
 
