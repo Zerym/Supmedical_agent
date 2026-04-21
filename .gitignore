@@ -15,3 +15,8 @@ media_cache.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# Logs
+session_store.db-wal
+session_store.db-shm
+database.py.bak
