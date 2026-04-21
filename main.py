@@ -12,6 +12,7 @@ import json
 import os
 import re
 import time
+from ipaddress import ip_address, ip_network
 from typing import Any, Dict, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -35,9 +36,9 @@ from session_store import (
     save_session as save_session_to_db,
 )
 from whatsapp_service import (
-    send_whatsapp_audio,
-    send_whatsapp_buttons,
-    send_whatsapp_text,
+    send_whatsapp_audio as _send_whatsapp_audio,
+    send_whatsapp_buttons as _send_whatsapp_buttons,
+    send_whatsapp_text as _send_whatsapp_text,
     upload_media_to_whatsapp,
 )
 
@@ -58,12 +59,49 @@ def _int_env(name: str, default: int) -> int:
     except Exception:
         return default
 
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
 # Sessions légères en mémoire
 # Exemple: {"2127...": {"state": "awaiting_callback_details", "formation": "...", "ts": 12345.6}}
 sessions: Dict[str, Dict[str, Any]] = {}
 MEDIA_CACHE_PATH = os.getenv("WHATSAPP_MEDIA_CACHE_PATH", "media_cache.json")
 SESSION_TIMEOUT_SECONDS = _int_env("SESSION_TIMEOUT_SECONDS", 1800)
 SESSION_TIMEOUT_NOTICE = "⌛ Votre session a expiré. Je vous renvoie le menu pour reprendre."
+COEXISTENCE_ENABLED = _bool_env("WHATSAPP_COEXISTENCE_ENABLED", True)
+COEXISTENCE_AUTO_DETECT = _bool_env("WHATSAPP_COEXISTENCE_AUTO_DETECT", True)
+HUMAN_OVERRIDE_TIMEOUT_SECONDS = _int_env("HUMAN_OVERRIDE_TIMEOUT_SECONDS", 1800)
+BOT_OUTBOUND_MESSAGE_TTL_SECONDS = _int_env("BOT_OUTBOUND_MESSAGE_TTL_SECONDS", 7200)
+HANDOFF_API_TOKEN = (os.getenv("HANDOFF_API_TOKEN") or "").strip()
+HANDOFF_ALLOWED_SOURCES = (os.getenv("HANDOFF_ALLOWED_SOURCES") or "").strip()
+HUMAN_TAKEOVER_NOTICE = os.getenv(
+    "HUMAN_TAKEOVER_NOTICE",
+    "👩‍💼 Un conseiller humain prend le relais. Je reste en pause pour eviter les reponses en double.",
+)
+HUMAN_RELEASE_NOTICE = os.getenv(
+    "HUMAN_RELEASE_NOTICE",
+    "🤖 Merci. Je reprends automatiquement la conversation.",
+)
+HUMAN_REQUEST_KEYWORDS = {
+    "conseiller",
+    "agent",
+    "humain",
+    "humaine",
+    "support",
+    "service client",
+    "service clientele",
+}
+BOT_RESUME_KEYWORDS = {
+    "bot",
+    "reprendre bot",
+    "reprends bot",
+    "retour bot",
+    "resume bot",
+}
 MAX_AUDIO_RECOVERY_RETRIES = 1
 AUDIO_RECOVERY_NOTICE = "🔁 L'audio a été rejeté par Meta. Je le renvoie en version compatible."
 
@@ -107,6 +145,22 @@ def _normalize_session(payload: Dict[str, Any]) -> Dict[str, Any]:
         ts = 0.0
     if ts <= 0:
         data["ts"] = time.time()
+
+    agent_mode = str(data.get("agent_mode") or "bot_mode").strip().lower()
+    if agent_mode not in {"bot_mode", "human_active"}:
+        agent_mode = "bot_mode"
+    data["agent_mode"] = agent_mode
+
+    if agent_mode == "human_active":
+        try:
+            human_ts = float(data.get("human_last_activity_ts") or 0)
+        except Exception:
+            human_ts = 0.0
+        if human_ts <= 0:
+            data["human_last_activity_ts"] = data["ts"]
+    else:
+        data.pop("human_last_activity_ts", None)
+
     return data
 
 
@@ -166,9 +220,74 @@ def touch_session(phone: str, session: Optional[Dict[str, Any]]) -> None:
     set_session(phone, refreshed)
 
 
+def _is_human_mode(session: Optional[Dict[str, Any]]) -> bool:
+    return str((session or {}).get("agent_mode") or "bot_mode").strip().lower() == "human_active"
+
+
+def _is_human_mode_timed_out(session: Optional[Dict[str, Any]]) -> bool:
+    if not _is_human_mode(session):
+        return False
+    if HUMAN_OVERRIDE_TIMEOUT_SECONDS <= 0:
+        return False
+    try:
+        last_activity = float((session or {}).get("human_last_activity_ts") or 0)
+    except Exception:
+        last_activity = 0.0
+    if last_activity <= 0:
+        return False
+    return (time.time() - last_activity) > HUMAN_OVERRIDE_TIMEOUT_SECONDS
+
+
+def _activate_human_mode(
+    phone: str,
+    reason: str,
+    actor: Optional[str] = None,
+    session: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = dict(session or {})
+    payload["agent_mode"] = "human_active"
+    payload["human_last_activity_ts"] = time.time()
+    payload["ts"] = time.time()
+    set_session(phone, payload)
+    log_event("info", phone, "human_mode_activated", reason=reason, actor=actor)
+    return payload
+
+
+def _release_to_bot_mode(
+    phone: str,
+    reason: str,
+    actor: Optional[str] = None,
+    session: Optional[Dict[str, Any]] = None,
+    reset_conversation: bool = True,
+) -> Dict[str, Any]:
+    payload = dict(session or {})
+    payload["agent_mode"] = "bot_mode"
+    payload.pop("human_last_activity_ts", None)
+    payload["ts"] = time.time()
+    if reset_conversation:
+        payload.pop("state", None)
+        payload.pop("formation", None)
+        payload.pop("score", None)
+        payload.pop("lead_name", None)
+    set_session(phone, payload)
+    log_event("info", phone, "human_mode_released", reason=reason, actor=actor, reset=reset_conversation)
+    return payload
+
+
+def _looks_like_human_request(normalized: str) -> bool:
+    text = normalized or ""
+    return any(keyword in text for keyword in HUMAN_REQUEST_KEYWORDS)
+
+
+def _looks_like_bot_resume_request(normalized: str) -> bool:
+    text = normalized or ""
+    return any(keyword in text for keyword in BOT_RESUME_KEYWORDS)
+
+
 MEDIA_ID_CACHE = load_media_cache()
 AUDIO_MESSAGE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 AUDIO_RECOVERY_ATTEMPTS: Dict[str, int] = {}
+BOT_OUTBOUND_MESSAGE_CONTEXT: Dict[str, Dict[str, Any]] = {}
 
 try:
     init_session_store()
@@ -243,6 +362,75 @@ def _extract_message_id(response: Any) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _cleanup_old_bot_outbound_messages() -> None:
+    if not BOT_OUTBOUND_MESSAGE_CONTEXT:
+        return
+
+    now = time.time()
+    stale_ids = [
+        message_id
+        for message_id, context in BOT_OUTBOUND_MESSAGE_CONTEXT.items()
+        if (now - float(context.get("ts") or 0)) > BOT_OUTBOUND_MESSAGE_TTL_SECONDS
+    ]
+    for message_id in stale_ids:
+        BOT_OUTBOUND_MESSAGE_CONTEXT.pop(message_id, None)
+
+
+def _remember_bot_outbound_message(phone: str, message_id: str, channel: str) -> None:
+    if not message_id:
+        return
+    BOT_OUTBOUND_MESSAGE_CONTEXT[message_id] = {
+        "phone": phone,
+        "channel": channel,
+        "ts": time.time(),
+    }
+    if len(BOT_OUTBOUND_MESSAGE_CONTEXT) > 1500:
+        _cleanup_old_bot_outbound_messages()
+        if len(BOT_OUTBOUND_MESSAGE_CONTEXT) > 1200:
+            oldest = sorted(
+                BOT_OUTBOUND_MESSAGE_CONTEXT.items(),
+                key=lambda item: float(item[1].get("ts") or 0),
+            )[:300]
+            for old_message_id, _ in oldest:
+                BOT_OUTBOUND_MESSAGE_CONTEXT.pop(old_message_id, None)
+
+
+def _track_bot_outbound_response(phone: str, channel: str, response: Any) -> None:
+    message_id = _extract_message_id(response)
+    if not message_id:
+        return
+    _remember_bot_outbound_message(phone, message_id, channel)
+
+
+def _is_known_bot_message_id(message_id: str) -> bool:
+    if not message_id:
+        return False
+    _cleanup_old_bot_outbound_messages()
+    context = BOT_OUTBOUND_MESSAGE_CONTEXT.get(message_id)
+    if not context:
+        return False
+    context["last_status_ts"] = time.time()
+    return True
+
+
+def send_whatsapp_text(to_number: str, message: str):
+    response = _send_whatsapp_text(to_number, message)
+    _track_bot_outbound_response(to_number, "text", response)
+    return response
+
+
+def send_whatsapp_audio(to_number: str, media_id: str):
+    response = _send_whatsapp_audio(to_number, media_id)
+    _track_bot_outbound_response(to_number, "audio", response)
+    return response
+
+
+def send_whatsapp_buttons(to_number: str, body_text: str, button_titles: list[str]):
+    response = _send_whatsapp_buttons(to_number, body_text, button_titles)
+    _track_bot_outbound_response(to_number, "interactive", response)
+    return response
 
 
 def _track_audio_message(phone: str, formation_name: str, media_id: str, response: Any) -> None:
@@ -445,12 +633,38 @@ def handle_message(phone: str, text: str) -> None:
     message = (text or "").strip()
     normalized = normalize_text(message)
     session, session_expired = get_active_session(phone)
-    log_event("info", phone, "incoming_message", message=message, normalized=normalized, session_state=session.get("state") if session else None)
+    log_event(
+        "info",
+        phone,
+        "incoming_message",
+        message=message,
+        normalized=normalized,
+        session_state=session.get("state") if session else None,
+        agent_mode=(session or {}).get("agent_mode", "bot_mode"),
+    )
 
     if session_expired:
         send_whatsapp_text(phone, SESSION_TIMEOUT_NOTICE)
         send_formations_menu(phone)
         session = None
+
+    if COEXISTENCE_ENABLED and _is_human_mode(session):
+        if _is_human_mode_timed_out(session):
+            session = _release_to_bot_mode(phone, reason="human_timeout", actor="system", session=session)
+            send_whatsapp_text(phone, HUMAN_RELEASE_NOTICE)
+        elif _looks_like_bot_resume_request(normalized):
+            _release_to_bot_mode(phone, reason="user_resume_request", actor=phone, session=session)
+            send_whatsapp_text(phone, HUMAN_RELEASE_NOTICE)
+            send_formations_menu(phone)
+            return
+        else:
+            log_event("info", phone, "bot_silenced_human_mode", message=message)
+            return
+
+    if COEXISTENCE_ENABLED and _looks_like_human_request(normalized):
+        _activate_human_mode(phone, reason="user_requested_human", actor=phone, session=session)
+        send_whatsapp_text(phone, HUMAN_TAKEOVER_NOTICE)
+        return
 
     # Raccourci global: retour menu à tout moment via "0" ou "menu".
     if is_menu_reset_command(message):
@@ -600,6 +814,130 @@ def handle_incoming_message(from_number: str, text: str) -> None:
     handle_message(from_number, text)
 
 
+def _parse_handoff_allowed_networks(raw_sources: str) -> list:
+    networks = []
+    for item in (raw_sources or "").split(","):
+        source = item.strip()
+        if not source:
+            continue
+        try:
+            if "/" in source:
+                networks.append(ip_network(source, strict=False))
+                continue
+
+            networks.append(ip_network(f"{source}/32", strict=False))
+        except Exception:
+            try:
+                networks.append(ip_network(f"{source}/128", strict=False))
+            except Exception:
+                continue
+    return networks
+
+
+HANDOFF_ALLOWED_NETWORKS = _parse_handoff_allowed_networks(HANDOFF_ALLOWED_SOURCES)
+
+
+def _request_source_ip(request: Request) -> Optional[str]:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        first_hop = forwarded_for.split(",", 1)[0].strip()
+        if first_hop:
+            return first_hop
+
+    client = request.client
+    if client and client.host:
+        return str(client.host)
+    return None
+
+
+def _assert_handoff_source(request: Request) -> None:
+    if not HANDOFF_ALLOWED_NETWORKS:
+        return
+
+    source_ip = _request_source_ip(request)
+    if not source_ip:
+        raise HTTPException(status_code=403, detail="Missing source IP")
+
+    try:
+        parsed_ip = ip_address(source_ip)
+    except Exception:
+        raise HTTPException(status_code=403, detail="Invalid source IP")
+
+    for network in HANDOFF_ALLOWED_NETWORKS:
+        if parsed_ip in network:
+            return
+
+    raise HTTPException(status_code=403, detail="Source IP not allowed")
+
+
+def _assert_handoff_auth(request: Request) -> None:
+    _assert_handoff_source(request)
+    if not HANDOFF_API_TOKEN:
+        return
+    incoming_token = (request.headers.get("x-handoff-token") or "").strip()
+    if incoming_token != HANDOFF_API_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid handoff token")
+
+
+@app.post("/handoff/takeover")
+async def handoff_takeover(request: Request) -> JSONResponse:
+    _assert_handoff_auth(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    phone = str(payload.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(status_code=422, detail="phone is required")
+
+    reason = str(payload.get("reason") or "manual_takeover")
+    actor = str(payload.get("actor") or "manual")
+    notify_user = bool(payload.get("notify_user", False))
+
+    session, _ = get_active_session(phone)
+    _activate_human_mode(phone, reason=reason, actor=actor, session=session)
+    if notify_user:
+        send_whatsapp_text(phone, HUMAN_TAKEOVER_NOTICE)
+
+    return JSONResponse({"status": "ok", "phone": phone, "agent_mode": "human_active"})
+
+
+@app.post("/handoff/release")
+async def handoff_release(request: Request) -> JSONResponse:
+    _assert_handoff_auth(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    phone = str(payload.get("phone") or "").strip()
+    if not phone:
+        raise HTTPException(status_code=422, detail="phone is required")
+
+    reason = str(payload.get("reason") or "manual_release")
+    actor = str(payload.get("actor") or "manual")
+    reset_conversation = bool(payload.get("reset_conversation", True))
+    notify_user = bool(payload.get("notify_user", False))
+
+    session, _ = get_active_session(phone)
+    _release_to_bot_mode(
+        phone,
+        reason=reason,
+        actor=actor,
+        session=session,
+        reset_conversation=reset_conversation,
+    )
+    if notify_user:
+        send_whatsapp_text(phone, HUMAN_RELEASE_NOTICE)
+
+    return JSONResponse({"status": "ok", "phone": phone, "agent_mode": "bot_mode"})
+
+
 @app.get("/webhook")
 async def webhook_verify(request: Request):
     params = request.query_params
@@ -618,6 +956,8 @@ async def webhook_receive(request: Request):
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
@@ -629,15 +969,18 @@ async def webhook_receive(request: Request):
             for status in statuses:
                 status_value = status.get("status")
                 recipient_id = status.get("recipient_id")
+                status_message_id = str(status.get("id") or "")
                 errors = status.get("errors") or []
+                known_bot_status = _is_known_bot_message_id(status_message_id)
                 if status_value == "failed":
                     log_event(
                         "error",
                         recipient_id,
                         "whatsapp_delivery_failed",
-                        message_id=status.get("id"),
+                        message_id=status_message_id,
                         errors=errors,
                         raw_status=status,
+                        source="bot" if known_bot_status else "external",
                     )
                     _recover_failed_audio_status(recipient_id, status)
                 else:
@@ -646,7 +989,25 @@ async def webhook_receive(request: Request):
                         recipient_id,
                         "whatsapp_delivery_status",
                         status=status_value,
-                        message_id=status.get("id"),
+                        message_id=status_message_id,
+                        source="bot" if known_bot_status else "external",
+                    )
+
+                if (
+                    COEXISTENCE_ENABLED
+                    and COEXISTENCE_AUTO_DETECT
+                    and status_value == "sent"
+                    and recipient_id
+                    and status_message_id
+                    and not known_bot_status
+                ):
+                    recipient = str(recipient_id)
+                    existing_session, _ = get_active_session(recipient)
+                    _activate_human_mode(
+                        recipient,
+                        reason="coexistence_external_sent_status",
+                        actor="coexistence_status",
+                        session=existing_session,
                     )
 
             for msg in messages:
